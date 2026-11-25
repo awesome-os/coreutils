@@ -367,3 +367,13 @@ To contribute to uutils, please see [CONTRIBUTING](CONTRIBUTING.md).
 uutils is licensed under the MIT License - see the `LICENSE` file for details
 
 GNU Coreutils is licensed under the GPL 3.0 or later.
+
+## Quick Install & Run (Windows / Linux / macOS)
+
+```sh
+# Install / hydrate from v11 CAS via holo-pm
+holo-pm install repository://github.com/awesome-os/coreutils@main
+
+# Or project & run directly via holo-project (0-byte hardlink)
+holo-project "project://rust/coreutils?from=repository://github.com/awesome-os/coreutils@main"
+```
