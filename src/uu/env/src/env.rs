@@ -1,0 +1,1728 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) chdir progname subcommand subcommands unsets setenv putenv spawnp SIGSEGV SIGBUS sigaction Sigmask sigprocmask elidable sigset sigaddset sigemptyset sigismember
+
+pub mod diagnostics;
+pub mod native_int_str;
+pub mod split_iterator;
+pub mod string_expander;
+pub mod string_parser;
+pub mod variable_parser;
+
+use clap::builder::ValueParser;
+use clap::{Arg, ArgAction, Command};
+use native_int_str::{
+    Convert, NCvt, NativeIntStr, NativeIntString, NativeStr, from_native_int_representation,
+    from_native_int_representation_owned, get_single_native_int_value,
+};
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+use nix::libc;
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
+#[cfg(unix)]
+use nix::unistd::execvp;
+use std::borrow::Cow;
+#[cfg(unix)]
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::env;
+#[cfg(unix)]
+use std::ffi::CString;
+use std::ffi::{OsStr, OsString};
+use std::io;
+use std::io::Read as _;
+use std::io::Write as _;
+use std::io::stderr;
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+use std::mem::zeroed;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
+#[cfg(not(unix))]
+use uucore::display::print_all_env_vars;
+use uucore::display::{Quotable, print_all_env_vars_quoted};
+use uucore::error::{ExitCode, UError, UResult, USimpleError, UUsageError, strip_errno};
+use uucore::i18n::get_ctype_encoding;
+use uucore::line_ending::LineEnding;
+use uucore::quoting_style::{QuotingStyle, parser as qs_parser, quoting_style_or_tty_env};
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+use uucore::signals::{
+    realtime_signal_bounds, signal_by_name_or_value, signal_name_by_value,
+    signal_number_upper_bound,
+};
+use uucore::translate;
+use uucore::{format_usage, show_warning};
+
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum EnvError {
+    #[error("{}", translate!("env-error-missing-closing-quote", "position" => .0, "quote" => .1))]
+    EnvMissingClosingQuote(usize, char),
+    #[error("{}", translate!("env-error-invalid-backslash-at-end", "position" => .0, "context" => .1))]
+    EnvInvalidBackslashAtEndOfStringInMinusS(usize, String),
+    #[error("{}", translate!("env-error-backslash-c-not-allowed", "position" => .0))]
+    EnvBackslashCNotAllowedInDoubleQuotes(usize),
+    #[error("{}", translate!("env-error-invalid-sequence", "position" => .0, "char" => .1))]
+    EnvInvalidSequenceBackslashXInMinusS(usize, char),
+    #[error("{}", translate!("env-error-missing-closing-brace", "position" => .0))]
+    EnvParsingOfVariableMissingClosingBrace(usize),
+    #[error("{}", translate!("env-error-missing-variable", "position" => .0))]
+    EnvParsingOfMissingVariable(usize),
+    #[error("{}", translate!("env-error-only-braced-variable", "position" => .0))]
+    EnvParsingOfVariableOnlyBracedName(usize),
+    #[error("{}", translate!("env-error-unexpected-number", "position" => .0, "char" => .1))]
+    EnvParsingOfVariableUnexpectedNumber(usize, String),
+    #[error("")]
+    EnvReachedEnd,
+    #[error("")]
+    EnvContinueWithDelimiter,
+    #[error("{}{:?}",.0,.1)]
+    EnvInternalError(usize, string_parser::Error),
+}
+
+impl From<string_parser::Error> for EnvError {
+    fn from(value: string_parser::Error) -> Self {
+        Self::EnvInternalError(value.peek_position, value)
+    }
+}
+
+mod options {
+    pub const IGNORE_ENVIRONMENT: &str = "ignore-environment";
+    pub const CHDIR: &str = "chdir";
+    pub const NULL: &str = "null";
+    pub const UNSET: &str = "unset";
+    pub const DEBUG: &str = "debug";
+    pub const SPLIT_STRING: &str = "split-string";
+    pub const ARGV0: &str = "argv0";
+    pub const IGNORE_SIGNAL: &str = "ignore-signal";
+    pub const DEFAULT_SIGNAL: &str = "default-signal";
+    pub const BLOCK_SIGNAL: &str = "block-signal";
+    pub const LIST_SIGNAL_HANDLING: &str = "list-signal-handling";
+    pub const ENV0_FROM: &str = "env0-from";
+}
+
+struct Options<'a> {
+    ignore_env: bool,
+    line_ending: LineEnding,
+    quoting_style: Option<QuotingStyle>,
+    running_directory: Option<&'a OsStr>,
+    env0_from: Option<&'a OsStr>,
+    unsets: Vec<&'a OsStr>,
+    sets: Vec<(Cow<'a, OsStr>, Cow<'a, OsStr>)>,
+    program: Vec<&'a OsStr>,
+    argv0: Option<&'a OsStr>,
+    #[cfg(all(unix, not(target_os = "fuchsia")))]
+    signal_actions: Vec<(SignalActionKind, SignalRequest)>,
+    #[cfg(all(unix, not(target_os = "fuchsia")))]
+    list_signal_handling: bool,
+}
+
+fn parse_name_value_opt<'a>(opts: &mut Options<'a>, opt: &'a OsStr) -> UResult<bool> {
+    // is it a NAME=VALUE like opt ?
+    let wrap = NativeStr::<'a>::new(opt);
+    let split_o = wrap.split_once('=');
+    if let Some((name, value)) = split_o {
+        // yes, so push name, value pair
+        opts.sets.push((name, value));
+        Ok(false)
+    } else {
+        // no, it's a program-like opt
+        parse_program_opt(opts, opt).map(|_| true)
+    }
+}
+
+fn parse_program_opt<'a>(opts: &mut Options<'a>, opt: &'a OsStr) -> UResult<()> {
+    if opts.line_ending == LineEnding::Nul {
+        Err(UUsageError::new(
+            125,
+            translate!("env-error-cannot-specify-null-with-command"),
+        ))
+    } else {
+        opts.program.push(opt);
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+fn parse_signal_value(signal_name: &str) -> UResult<usize> {
+    let signal_name_upcase = signal_name.to_uppercase();
+    let optional_signal_value = signal_by_name_or_value(&signal_name_upcase);
+    let error = USimpleError::new(
+        125,
+        translate!("env-error-invalid-signal", "signal" => signal_name.quote()),
+    );
+    match optional_signal_value {
+        Some(sig_val) => {
+            if sig_val == 0 {
+                Err(error)
+            } else {
+                Ok(sig_val)
+            }
+        }
+        None => Err(error),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+fn parse_signal_opt(target: &mut SignalRequest, opt: &OsStr) -> UResult<()> {
+    if opt.is_empty() {
+        return Ok(());
+    }
+
+    for sig in opt
+        .as_bytes()
+        .split(|&b| b == b',')
+        .filter(|chunk| !chunk.is_empty())
+        .map(OsStr::from_bytes)
+    {
+        let sig_str = sig.to_str().ok_or_else(|| {
+            USimpleError::new(
+                1,
+                translate!("env-error-invalid-signal", "signal" => sig.quote()),
+            )
+        })?;
+        let sig_val = parse_signal_value(sig_str)?;
+        target.signals.insert(sig_val);
+    }
+
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+#[derive(Default, Debug)]
+struct SignalRequest {
+    apply_all: bool,
+    signals: BTreeSet<usize>,
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+impl SignalRequest {
+    fn is_empty(&self) -> bool {
+        !self.apply_all && self.signals.is_empty()
+    }
+
+    fn for_each_signal<F>(&self, mut f: F) -> UResult<()>
+    where
+        F: FnMut(usize) -> UResult<()>,
+    {
+        if self.is_empty() {
+            return Ok(());
+        }
+        for &sig in &self.signals {
+            f(sig)?;
+        }
+        if self.apply_all {
+            for sig_value in 1..=signal_number_upper_bound() {
+                if self.signals.contains(&sig_value) {
+                    continue;
+                }
+                // SIGKILL (9) and SIGSTOP (17 on mac, 19 on linux) cannot be caught or ignored
+                if sig_value == libc::SIGKILL as usize || sig_value == libc::SIGSTOP as usize {
+                    continue;
+                }
+                f(sig_value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+#[derive(Copy, Clone)]
+enum SignalActionKind {
+    Default,
+    Ignore,
+    Block,
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+fn build_signal_actions(
+    matches: &clap::ArgMatches,
+    signal_apply_all: &BTreeSet<&str>,
+) -> UResult<Vec<(SignalActionKind, SignalRequest)>> {
+    let mut actions = Vec::new();
+
+    for (option, action_kind) in [
+        (options::IGNORE_SIGNAL, SignalActionKind::Ignore),
+        (options::DEFAULT_SIGNAL, SignalActionKind::Default),
+        (options::BLOCK_SIGNAL, SignalActionKind::Block),
+    ] {
+        let (Some(values), Some(indices)) = (
+            matches.get_many::<OsString>(option),
+            matches.indices_of(option),
+        ) else {
+            continue;
+        };
+
+        for (opt, index) in values.zip(indices) {
+            let mut request = SignalRequest::default();
+
+            if opt.is_empty() {
+                // An empty value means every signal only when the option was also used
+                // without a value; an empty value after the equals sign does nothing.
+                if !signal_apply_all.contains(option) {
+                    continue;
+                }
+                request.apply_all = true;
+            } else {
+                parse_signal_opt(&mut request, opt)?;
+            }
+
+            actions.push((index, action_kind, request));
+        }
+    }
+
+    actions.sort_by_key(|(index, _, _)| *index);
+
+    Ok(actions
+        .into_iter()
+        .map(|(_, action_kind, request)| (action_kind, request))
+        .collect())
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+fn signal_is_valid(sig: usize) -> bool {
+    if Signal::try_from(sig as i32).is_err() {
+        // nix::sys::signal does not know about real-time signals, so check that
+        // ourselves.
+        if let Some((rtmin, rtmax)) = realtime_signal_bounds() {
+            return sig >= rtmin && sig <= rtmax;
+        }
+
+        return false;
+    }
+
+    true
+}
+
+fn validate_unset_arg(name: &OsStr) -> UResult<()> {
+    let native_name = NativeStr::new(name);
+    if name.is_empty()
+        || native_name.contains('\0').unwrap_or(false)
+        || native_name.contains('=').unwrap_or(false)
+    {
+        return Err(USimpleError::new(
+            125,
+            translate!("env-error-cannot-unset-invalid", "name" => name.quote()),
+        ));
+    }
+    Ok(())
+}
+
+fn entry_key(entry: &[u8]) -> Option<&[u8]> {
+    entry
+        .iter()
+        .position(|&b| b == b'=')
+        .map(|pos| &entry[..pos])
+}
+
+fn read_env0_file(file: &OsStr) -> UResult<Vec<u8>> {
+    let res = if file == "-" {
+        let mut buf = Vec::new();
+        io::stdin().read_to_end(&mut buf).map(|_| buf)
+    } else {
+        std::fs::read(file)
+    };
+    let bytes = res.map_err(|e| {
+        USimpleError::new(
+            125,
+            translate!(
+                "env-error-cannot-read-file",
+                "file" => file.quote(),
+                "error" => strip_errno(&e)
+            ),
+        )
+    })?;
+
+    if bytes.last().is_some_and(|&byte| byte != 0) {
+        return Err(USimpleError::new(
+            125,
+            translate!(
+                "env-error-file-must-end-nul",
+                "file" => file.maybe_quote()
+            ),
+        ));
+    }
+
+    Ok(bytes)
+}
+
+// https://doc.rust-lang.org/src/std/sys/env/unix.rs.html
+#[cfg(all(unix, target_vendor = "apple"))]
+/// Returns the address of the process's `environ` pointer.
+///
+/// # Safety
+///
+/// The result may only be dereferenced while no other thread reads or
+/// changes the environment.
+unsafe fn environ() -> *mut *mut *mut libc::c_char {
+    // SAFETY: _NSGetEnviron takes no arguments and returns the process's environ pointer.
+    unsafe { libc::_NSGetEnviron() }
+}
+
+#[cfg(all(unix, target_os = "freebsd"))]
+/// Returns the address of the process's `environ` pointer.
+///
+/// # Safety
+///
+/// The result may only be dereferenced while no other thread reads or
+/// changes the environment.
+unsafe fn environ() -> *mut *mut *mut libc::c_char {
+    use std::sync::LazyLock;
+
+    struct Environ(*mut *mut *mut libc::c_char);
+    // SAFETY: the pointer is the address of the process-wide `environ`, which
+    // lives for the whole program; it is only read or written from this thread.
+    unsafe impl Send for Environ {}
+    // SAFETY: see Send above.
+    unsafe impl Sync for Environ {}
+
+    static ENVIRON: LazyLock<Environ> = LazyLock::new(|| {
+        // SAFETY: looking up a symbol by a valid C string in the global scope.
+        Environ(unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"environ".as_ptr()).cast() })
+    });
+    ENVIRON.0
+}
+
+#[cfg(all(unix, not(any(target_os = "freebsd", target_vendor = "apple"))))]
+/// Returns the address of the process's `environ` pointer.
+///
+/// # Safety
+///
+/// The result may only be dereferenced while no other thread reads or
+/// changes the environment.
+unsafe fn environ() -> *mut *mut *mut libc::c_char {
+    unsafe extern "C" {
+        static mut environ: *mut *mut libc::c_char;
+    }
+    &raw mut environ
+}
+
+fn load_env0_from(opts: &Options, env0_file: &OsStr) -> UResult<Vec<Vec<u8>>> {
+    let mut entries = if opts.ignore_env {
+        Vec::new()
+    } else {
+        #[cfg(unix)]
+        {
+            let mut cur = Vec::new();
+            // SAFETY: environ() points at the process's environ, a
+            // null-terminated array of NUL-terminated strings; nothing
+            // modifies it while it is copied here.
+            let mut ptr = unsafe { *environ() };
+            // SAFETY: as above, every entry before the null one is a valid C string.
+            unsafe {
+                while !ptr.is_null() && !(*ptr).is_null() {
+                    let cstr = std::ffi::CStr::from_ptr(*ptr);
+                    cur.push(cstr.to_bytes().to_vec());
+                    ptr = ptr.add(1);
+                }
+            }
+            cur
+        }
+        #[cfg(not(unix))]
+        {
+            env::vars_os()
+                .map(|(k, v)| {
+                    let mut b = k.as_encoded_bytes().to_vec();
+                    b.push(b'=');
+                    b.extend_from_slice(v.as_encoded_bytes());
+                    b
+                })
+                .collect()
+        }
+    };
+
+    let raw_data = read_env0_file(env0_file)?;
+
+    if opts.ignore_env {
+        entries.extend(
+            raw_data
+                .split_inclusive(|&b| b == 0)
+                .map(|chunk| chunk[..chunk.len() - 1].to_vec()),
+        );
+    } else {
+        let mut key_map = HashMap::<Cow<[u8]>, usize>::with_capacity(entries.len());
+        for (i, entry) in entries.iter().enumerate() {
+            if let Some(key) = entry_key(entry) {
+                key_map.entry(Cow::Owned(key.to_vec())).or_insert(i);
+            }
+        }
+        for chunk in raw_data.split_inclusive(|&b| b == 0) {
+            let entry_slice = &chunk[..chunk.len() - 1];
+            if let Some(key) = entry_key(entry_slice) {
+                if let Some(&idx) = key_map.get(key) {
+                    entries[idx] = entry_slice.to_vec();
+                } else {
+                    key_map.insert(Cow::Borrowed(key), entries.len());
+                    entries.push(entry_slice.to_vec());
+                }
+            } else {
+                entries.push(entry_slice.to_vec());
+            }
+        }
+    }
+
+    for name in &opts.unsets {
+        validate_unset_arg(name)?;
+        let name_bytes = name.as_encoded_bytes();
+        entries.retain(|e| entry_key(e) != Some(name_bytes));
+    }
+
+    for (name, val) in &opts.sets {
+        if name.is_empty() {
+            show_warning!(
+                "{}",
+                translate!("env-warning-no-name-specified", "value" => val.quote())
+            );
+            continue;
+        }
+        let mut new_entry = name.as_encoded_bytes().to_vec();
+        new_entry.push(b'=');
+        new_entry.extend_from_slice(val.as_encoded_bytes());
+        let key = name.as_encoded_bytes();
+        if let Some(idx) = entries.iter().position(|e| entry_key(e) == Some(key)) {
+            entries[idx] = new_entry;
+        } else {
+            entries.push(new_entry);
+        }
+    }
+
+    Ok(entries)
+}
+pub fn uu_app() -> Command {
+    Command::new("env")
+        .version(uucore::crate_version!())
+        .help_template(uucore::localized_help_template("env"))
+        .about(translate!("env-about"))
+        .override_usage(format_usage(&translate!("env-usage")))
+        .after_help(translate!("env-after-help"))
+        .infer_long_args(true)
+        .trailing_var_arg(true)
+        .arg(
+            Arg::new(options::IGNORE_ENVIRONMENT)
+                .short('i')
+                .long(options::IGNORE_ENVIRONMENT)
+                .help(translate!("env-help-ignore-environment"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new(options::CHDIR)
+                .short('C') // GNU env compatibility
+                .long(options::CHDIR)
+                .number_of_values(1)
+                .value_name("DIR")
+                .value_parser(ValueParser::os_string())
+                .value_hint(clap::ValueHint::DirPath)
+                .allow_hyphen_values(true)
+                .help(translate!("env-help-chdir")),
+        )
+        .arg(
+            Arg::new(options::NULL)
+                .short('0')
+                .long(options::NULL)
+                .help(translate!("env-help-null"))
+                .action(ArgAction::SetTrue),
+        )
+        .arg(qs_parser::clap_quoting_argument())
+        .arg(
+            Arg::new(options::ENV0_FROM)
+                .overrides_with(options::ENV0_FROM)
+                .long(options::ENV0_FROM)
+                .value_name("FILE")
+                .value_hint(clap::ValueHint::FilePath)
+                .value_parser(ValueParser::os_string())
+                .allow_hyphen_values(true)
+                .action(ArgAction::Set)
+                .help(translate!("env-help-env0-from")),
+        )
+        .arg(
+            Arg::new(options::UNSET)
+                .short('u')
+                .long(options::UNSET)
+                .value_name("NAME")
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string())
+                .allow_hyphen_values(true)
+                .help(translate!("env-help-unset")),
+        )
+        .arg(
+            Arg::new(options::DEBUG)
+                .short('v')
+                .long(options::DEBUG)
+                // Not ArgAction::Count: clap would show "--debug..." in --help
+                .action(ArgAction::Append)
+                .num_args(0)
+                .default_missing_value("")
+                .help(translate!("env-help-debug")),
+        )
+        .arg(
+            Arg::new(options::SPLIT_STRING) // split string handling is implemented directly, not using CLAP. But this entry here is needed for the help information output.
+                .short('S')
+                .long(options::SPLIT_STRING)
+                .value_name("S")
+                .action(ArgAction::Set)
+                .value_parser(ValueParser::os_string())
+                .help(translate!("env-help-split-string")),
+        )
+        .arg(
+            Arg::new(options::ARGV0)
+                .overrides_with(options::ARGV0)
+                .short('a')
+                .long(options::ARGV0)
+                .value_name("a")
+                .action(ArgAction::Set)
+                .value_parser(ValueParser::os_string())
+                .allow_hyphen_values(true)
+                .help(translate!("env-help-argv0")),
+        )
+        .arg(
+            Arg::new("vars")
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string()),
+        )
+        .arg(
+            Arg::new(options::IGNORE_SIGNAL)
+                .long(options::IGNORE_SIGNAL)
+                .value_name("SIG")
+                .num_args(0..=1)
+                .require_equals(true)
+                .action(ArgAction::Append)
+                .default_missing_value("")
+                .value_parser(ValueParser::os_string())
+                .help(translate!("env-help-ignore-signal")),
+        )
+        .arg(
+            Arg::new(options::DEFAULT_SIGNAL)
+                .long(options::DEFAULT_SIGNAL)
+                .value_name("SIG")
+                .num_args(0..=1)
+                .require_equals(true)
+                .action(ArgAction::Append)
+                .default_missing_value("")
+                .value_parser(ValueParser::os_string())
+                .help(translate!("env-help-default-signal")),
+        )
+        .arg(
+            Arg::new(options::BLOCK_SIGNAL)
+                .long(options::BLOCK_SIGNAL)
+                .value_name("SIG")
+                .num_args(0..=1)
+                .require_equals(true)
+                .action(ArgAction::Append)
+                .default_missing_value("")
+                .value_parser(ValueParser::os_string())
+                .help(translate!("env-help-block-signal")),
+        )
+        .arg(
+            Arg::new(options::LIST_SIGNAL_HANDLING)
+                .long(options::LIST_SIGNAL_HANDLING)
+                .action(ArgAction::SetTrue)
+                .help(translate!("env-help-list-signal-handling")),
+        )
+}
+
+pub fn parse_args_from_str(text: &NativeIntStr) -> UResult<Vec<NativeIntString>> {
+    parse_args_from_str_at(text, None)
+}
+
+/// As [`parse_args_from_str`], pointing a caret into the argument the string
+/// came from.
+///
+/// # Arguments
+///
+/// * `text` - The `-S` string to split.
+/// * `located` - The whole argument list and the index of the argument
+///   carrying `text`, or `None` when no diagnostic is wanted. The argument is
+///   named rather than searched for, so a command that repeats the string
+///   elsewhere still points at the right one.
+fn parse_args_from_str_at(
+    text: &NativeIntStr,
+    located: Option<(&[OsString], usize)>,
+) -> UResult<Vec<NativeIntString>> {
+    split_iterator::split(text).map_err(|e| {
+        let error = to_error(text, &e);
+        // The `-S` string is echoed back as typed, so a string that is not
+        // text cannot be pointed into.
+        let reported = located.is_some_and(|(args, index)| {
+            from_native_int_representation(Cow::Borrowed(text))
+                .to_str()
+                .is_some_and(|payload| {
+                    diagnostics::render(args, index, payload, &error.to_string(), &e)
+                })
+        });
+        uucore::error::quiet_if_reported(reported, error)
+    })
+}
+
+/// The user-facing error for a `-S` string that does not split.
+fn to_error(text: &NativeIntStr, e: &EnvError) -> Box<dyn UError> {
+    let var_error = |pos: usize| {
+        // Find the '$' that started this variable reference and format
+        // the error like GNU: "only ${VARNAME} expansion is supported, error at: $..."
+        let dollar = get_single_native_int_value('$');
+        let dollar_pos = text[..pos]
+            .iter()
+            .rposition(|&c| Some(c) == dollar)
+            .unwrap_or(pos);
+        let rest = from_native_int_representation(Cow::Borrowed(&text[dollar_pos..]));
+        USimpleError::new(
+            125,
+            translate!("env-error-only-braced-variable-at", "rest" => rest.to_string_lossy()),
+        )
+    };
+    match e {
+        EnvError::EnvBackslashCNotAllowedInDoubleQuotes(_)
+        | EnvError::EnvInvalidBackslashAtEndOfStringInMinusS(_, _)
+        | EnvError::EnvInvalidSequenceBackslashXInMinusS(_, _) => {
+            USimpleError::new(125, e.to_string())
+        }
+        EnvError::EnvMissingClosingQuote(_, _) => USimpleError::new(125, e.to_string()),
+        EnvError::EnvParsingOfVariableMissingClosingBrace(pos)
+        | EnvError::EnvParsingOfMissingVariable(pos)
+        | EnvError::EnvParsingOfVariableOnlyBracedName(pos)
+        | EnvError::EnvParsingOfVariableUnexpectedNumber(pos, _) => var_error(*pos),
+        _ => USimpleError::new(
+            125,
+            translate!("env-error-generic", "error" => format!("{e:?}")),
+        ),
+    }
+}
+
+fn debug_print_args(args: &[OsString]) {
+    let mut error = stderr().lock();
+    let _ = writeln!(error, "input args:");
+    for (i, arg) in args.iter().enumerate() {
+        let _ = writeln!(error, "arg[{i}]: {}", arg.quote());
+    }
+}
+
+fn check_and_handle_string_args(
+    arg: &OsString,
+    prefix_to_test: &str,
+    all_args: &mut Vec<OsString>,
+    do_debug_print_args: Option<&Vec<OsString>>,
+    require_non_empty_payload: bool,
+    strip_optional_leading_equals: bool,
+    located: Option<(&[OsString], usize)>,
+) -> UResult<bool> {
+    let native_arg = NCvt::convert(arg);
+    if let Some(remaining_arg) = native_arg.strip_prefix(&*NCvt::convert(prefix_to_test)) {
+        if require_non_empty_payload && remaining_arg.is_empty() {
+            return Ok(false);
+        }
+
+        if let Some(input_args) = do_debug_print_args {
+            debug_print_args(input_args); // do it here, such that its also printed when we get an error/panic during parsing
+        }
+
+        let remaining_arg = if strip_optional_leading_equals {
+            if let Some(stripped_remaining_arg) = remaining_arg.strip_prefix(&*NCvt::convert("=")) {
+                stripped_remaining_arg
+            } else {
+                remaining_arg
+            }
+        } else {
+            remaining_arg
+        };
+
+        let arg_strings = parse_args_from_str_at(remaining_arg, located)?;
+        all_args.extend(
+            arg_strings
+                .into_iter()
+                .map(from_native_int_representation_owned),
+        );
+
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Walk an argument in option position. Set `expecting_arg` when the next
+/// argument is this option's value, and keep a leading `=` in a value attached
+/// to a short option: clap consumes it as a separator, whereas env treats it as
+/// part of the value.
+fn scan_option(
+    arg: &mut OsString,
+    short_flags_with_args: &[u8],
+    flags_with_args: &[&str],
+    expecting_arg: &mut bool,
+    options_ended: &mut bool,
+) -> UResult<()> {
+    if std::mem::take(expecting_arg) || *options_ended {
+        return Ok(());
+    }
+    let bytes = arg.as_encoded_bytes();
+    if bytes == b"--" {
+        *options_ended = true;
+    } else if let Some(long) = bytes.strip_prefix(b"--") {
+        *expecting_arg = flags_with_args
+            .iter()
+            .any(|name| name.as_bytes().starts_with(long));
+    } else if let Some(short) = bytes.strip_prefix(b"-").filter(|s| !s.is_empty()) {
+        if let Some(index) = short
+            .iter()
+            .position(|option| short_flags_with_args.contains(option))
+        {
+            if short.get(index + 1) == Some(&b'=') {
+                let mut value = bytes.to_vec();
+                value.insert(index + 2, b'=');
+                *arg = uucore::os_str_from_bytes(&value)?.to_os_string();
+            } else {
+                *expecting_arg = index + 1 == short.len();
+            }
+        }
+    } else {
+        // The first operand ends the options.
+        *options_ended = true;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct EnvAppData {
+    do_debug_printing: bool,
+    do_input_debug_printing: Option<bool>,
+    had_string_argument: bool,
+}
+
+struct ParsedArguments {
+    original_args: Vec<OsString>,
+    matches: clap::ArgMatches,
+    #[cfg(all(unix, not(target_os = "fuchsia")))]
+    signal_apply_all: BTreeSet<&'static str>,
+}
+
+impl EnvAppData {
+    #[cold]
+    #[inline(never)]
+    fn make_error_no_such_file_or_dir(&self, prog: &OsStr) -> Box<dyn UError> {
+        uucore::show_error!(
+            "{}",
+            translate!("env-error-no-such-file", "program" => prog.quote())
+        );
+        if !self.had_string_argument {
+            uucore::show_error!("{}", translate!("env-error-use-s-shebang"));
+        }
+        ExitCode::new(127)
+    }
+
+    fn process_all_string_arguments(
+        &mut self,
+        original_args: &Vec<OsString>,
+    ) -> UResult<Vec<OsString>> {
+        let mut all_args: Vec<OsString> = Vec::new();
+        let mut expecting_arg = false;
+        // Set by scan_option at "--" or at the first operand (NAME=VALUE or
+        // the command); later arguments are passed through untouched.
+        let mut options_ended = false;
+        let app = uu_app();
+        let args_with_values: Vec<&Arg> = app
+            .get_arguments()
+            .filter(|arg| {
+                arg.get_action().takes_values()
+                    && !arg.is_require_equals_set()
+                    && arg
+                        .get_num_args()
+                        .is_none_or(|range| range.max_values() > 0)
+            })
+            .collect();
+        let short_flags_with_args: Vec<u8> = args_with_values
+            .iter()
+            .filter_map(|arg| arg.get_short())
+            .filter(char::is_ascii)
+            .map(|short| short as u8)
+            .collect();
+        let flags_with_args: Vec<&str> = args_with_values
+            .iter()
+            .filter_map(|arg| arg.get_long())
+            .collect();
+        let mut consumed_split_payload_arg: Option<usize> = None;
+        for (n, arg) in original_args.iter().enumerate() {
+            if consumed_split_payload_arg == Some(n) {
+                consumed_split_payload_arg = None;
+                continue;
+            }
+            if options_ended {
+                all_args.push(arg.clone());
+                continue;
+            }
+            // The value of a detached -C, -u or -a is taken as is, even when
+            // it starts with -S, like GNU env does.
+            if expecting_arg {
+                expecting_arg = false;
+                all_args.push(arg.clone());
+                continue;
+            }
+            let start = all_args.len();
+            // Where the `-S` string sits, for the caret: the argument the
+            // parser is looking at right now.
+            let located = uucore::diagnostics::enabled().then_some((original_args.as_slice(), n));
+            match arg {
+                b if check_and_handle_string_args(
+                    b,
+                    "--split-string",
+                    &mut all_args,
+                    None,
+                    true,
+                    true,
+                    located,
+                )? =>
+                {
+                    self.had_string_argument = true;
+                }
+                b if check_and_handle_string_args(
+                    b,
+                    "-S",
+                    &mut all_args,
+                    None,
+                    true,
+                    false,
+                    located,
+                )? =>
+                {
+                    self.had_string_argument = true;
+                }
+                b if check_and_handle_string_args(
+                    b,
+                    "-vS",
+                    &mut all_args,
+                    None,
+                    true,
+                    false,
+                    located,
+                )? =>
+                {
+                    self.do_debug_printing = true;
+                    self.had_string_argument = true;
+                }
+                b if check_and_handle_string_args(
+                    b,
+                    "-vvS",
+                    &mut all_args,
+                    Some(original_args),
+                    true,
+                    false,
+                    located,
+                )? =>
+                {
+                    self.do_debug_printing = true;
+                    self.do_input_debug_printing = Some(false); // already done
+                    self.had_string_argument = true;
+                }
+                b if b == "--split-string" || b == "-S" || b == "-vS" || b == "-vvS" => {
+                    let Some(next_arg) = original_args.get(n + 1) else {
+                        all_args.push(arg.clone());
+                        continue;
+                    };
+
+                    if b == "-vS" || b == "-vvS" {
+                        self.do_debug_printing = true;
+                    }
+                    if b == "-vvS" {
+                        debug_print_args(original_args);
+                        self.do_input_debug_printing = Some(false);
+                    }
+
+                    let native_next_arg = NCvt::convert(next_arg);
+                    // The string is the argument after this one, detached.
+                    let located =
+                        uucore::diagnostics::enabled().then_some((original_args.as_slice(), n + 1));
+                    let arg_strings = parse_args_from_str_at(native_next_arg.as_ref(), located)?;
+                    all_args.extend(
+                        arg_strings
+                            .into_iter()
+                            .map(from_native_int_representation_owned),
+                    );
+                    self.had_string_argument = true;
+                    expecting_arg = false;
+                    consumed_split_payload_arg = Some(n + 1);
+                }
+                _ => {
+                    all_args.push(arg.clone());
+                    if n == 0 {
+                        continue;
+                    }
+                }
+            }
+            // Arguments split out of a `-S` string are options too.
+            for new_arg in &mut all_args[start..] {
+                scan_option(
+                    new_arg,
+                    &short_flags_with_args,
+                    &flags_with_args,
+                    &mut expecting_arg,
+                    &mut options_ended,
+                )?;
+            }
+        }
+
+        Ok(all_args)
+    }
+
+    fn parse_arguments(
+        &mut self,
+        original_args: impl uucore::Args,
+    ) -> Result<ParsedArguments, Box<dyn UError>> {
+        let original_args: Vec<OsString> = original_args.collect();
+        let args = self.process_all_string_arguments(&original_args)?;
+        #[cfg(unix)]
+        let mut signal_apply_all = BTreeSet::new();
+
+        #[cfg(unix)]
+        for arg in &args {
+            if arg == "--ignore-signal" {
+                signal_apply_all.insert(options::IGNORE_SIGNAL);
+            } else if arg == "--default-signal" {
+                signal_apply_all.insert(options::DEFAULT_SIGNAL);
+            } else if arg == "--block-signal" {
+                signal_apply_all.insert(options::BLOCK_SIGNAL);
+            }
+        }
+
+        let app = uu_app();
+        let matches = match app.try_get_matches_from(args) {
+            Ok(matches) => matches,
+            Err(e) => {
+                match e.kind() {
+                    clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayVersion => return Err(e.into()),
+                    _ => {
+                        // Use ErrorFormatter directly to handle error with shebang message callback
+                        let formatter = uucore::clap_localization::ErrorFormatter::new("env");
+                        formatter.print_error_and_exit_with_callback(&e, 125, || {
+                            let _ = writeln!(
+                                stderr(),
+                                "env: {}",
+                                translate!("env-error-use-s-shebang")
+                            );
+                        });
+                    }
+                }
+            }
+        };
+        Ok(ParsedArguments {
+            original_args,
+            matches,
+            #[cfg(all(unix, not(target_os = "fuchsia")))]
+            signal_apply_all,
+        })
+    }
+
+    fn run_env(&mut self, original_args: impl uucore::Args) -> UResult<()> {
+        let ParsedArguments {
+            original_args,
+            matches,
+            #[cfg(all(unix, not(target_os = "fuchsia")))]
+            signal_apply_all,
+        } = self.parse_arguments(original_args)?;
+
+        let debug_level = matches
+            .get_many::<String>(options::DEBUG)
+            .map_or(0, Iterator::count);
+        self.do_debug_printing = self.do_debug_printing || debug_level != 0;
+        self.do_input_debug_printing = self.do_input_debug_printing.or(Some(debug_level >= 2));
+        if Some(true) == self.do_input_debug_printing {
+            debug_print_args(&original_args);
+            self.do_input_debug_printing = Some(false);
+        }
+
+        let opts = make_options(
+            &matches,
+            #[cfg(all(unix, not(target_os = "fuchsia")))]
+            &signal_apply_all,
+        )?;
+
+        #[allow(unused_mut)]
+        let mut custom_env = opts
+            .env0_from
+            .map(|env0_file| load_env0_from(&opts, env0_file))
+            .transpose()?;
+
+        if custom_env.is_none() {
+            apply_removal_of_all_env_vars(&opts);
+            apply_unset_env_vars(&opts)?;
+            apply_specified_env_vars(&opts);
+        }
+
+        #[cfg(all(unix, not(target_os = "fuchsia")))]
+        {
+            let mut sigpipe_action = None;
+            // GNU applies the options in the order they are given, so the last one for a
+            // signal wins.
+            for (action_kind, request) in &opts.signal_actions {
+                if let Some(kind) = apply_signal_action(request, *action_kind)? {
+                    sigpipe_action = Some(kind);
+                }
+            }
+            if opts.list_signal_handling {
+                list_signal_handling();
+            }
+            if let Some(ref mut entries) = custom_env
+                && matches!(sigpipe_action, Some(SignalActionKind::Default))
+            {
+                let sigpipe_entry = b"RUST_SIGPIPE=default".to_vec();
+                if let Some(idx) = entries
+                    .iter()
+                    .position(|e| entry_key(e) == Some(b"RUST_SIGPIPE"))
+                {
+                    entries[idx] = sigpipe_entry;
+                } else {
+                    entries.push(sigpipe_entry);
+                }
+            }
+        }
+
+        // GNU env requires a command when --argv0 is given. Validate before
+        // apply_change_directory performs its side effect.
+        if opts.program.is_empty() && opts.argv0.is_some() {
+            return Err(UUsageError::new(
+                125,
+                translate!("env-error-must-specify-command-with-argv0"),
+            ));
+        }
+
+        apply_change_directory(&opts)?;
+        if opts.program.is_empty() {
+            if let Some(ref entries) = custom_env {
+                let stdout = io::stdout().lock();
+                let mut writer = io::BufWriter::new(stdout);
+                for entry in entries {
+                    writer.write_all(entry)?;
+                    match opts.line_ending {
+                        LineEnding::Nul => writer.write_all(b"\0")?,
+                        LineEnding::Newline => writer.write_all(b"\n")?,
+                    }
+                }
+                writer.flush()?;
+            } else if let Some(style) = quoting_style_or_tty_env(opts.quoting_style) {
+                print_all_env_vars_quoted(
+                    io::stdout(),
+                    opts.line_ending,
+                    style,
+                    get_ctype_encoding(),
+                )?;
+            } else {
+                // no program provided, so just dump all env vars to stdout
+                #[cfg(unix)]
+                {
+                    let stdout = io::stdout().lock();
+                    let mut writer = io::BufWriter::new(stdout);
+                    // SAFETY: environ is a null-terminated array of C strings,
+                    // left untouched while it is printed.
+                    unsafe {
+                        let mut ptr = *environ();
+                        while !(*ptr).is_null() {
+                            let cstr = std::ffi::CStr::from_ptr(*ptr);
+                            writer.write_all(cstr.to_bytes())?;
+                            match opts.line_ending {
+                                LineEnding::Nul => writer.write_all(b"\0")?,
+                                LineEnding::Newline => writer.write_all(b"\n")?,
+                            }
+                            ptr = ptr.add(1);
+                        }
+                    }
+                    writer.flush()?;
+                }
+                #[cfg(not(unix))]
+                {
+                    print_all_env_vars(io::stdout(), opts.line_ending)?;
+                }
+            }
+        } else {
+            return self.run_program(&opts, self.do_debug_printing, custom_env.as_deref());
+        }
+
+        Ok(())
+    }
+
+    /// Run the program specified by the options.
+    ///
+    /// Note that the env command must exec the program, not spawn it. See
+    /// <https://github.com/uutils/coreutils/issues/8361> for more information.
+    ///
+    /// Exit status:
+    /// - 125: if the env command itself fails
+    /// - 126: if the program is found but cannot be invoked
+    /// - 127: if the program cannot be found
+    fn run_program(
+        &mut self,
+        opts: &Options<'_>,
+        do_debug_printing: bool,
+        custom_env: Option<&[Vec<u8>]>,
+    ) -> Result<(), Box<dyn UError>> {
+        let prog = Cow::from(opts.program[0]);
+
+        let arg0 = match opts.argv0 {
+            None => prog.clone(),
+            Some(argv0) if cfg!(unix) => {
+                let arg0 = Cow::Borrowed(argv0);
+                if do_debug_printing {
+                    let _ = writeln!(stderr(), "argv0:     {}", arg0.quote());
+                }
+                arg0
+            }
+            Some(_) => {
+                return Err(USimpleError::new(
+                    2,
+                    translate!("env-error-argv0-not-supported"),
+                ));
+            }
+        };
+
+        let args = &opts.program[1..];
+
+        if do_debug_printing {
+            let mut error = stderr().lock();
+            let _ = writeln!(error, "executing: {}", prog.quote());
+            let arg_prefix = "   arg";
+            let _ = writeln!(error, "{arg_prefix}[{}]= {}", 0, arg0.quote());
+            for (i, arg) in args.iter().enumerate() {
+                let _ = writeln!(error, "{arg_prefix}[{}]= {}", i + 1, arg.quote());
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            // Use execvp() directly to preserve signal handlers set by apply_signal_action().
+            // Command::exec() would reset SIGPIPE, interfering with --ignore-signal=PIPE.
+
+            // Convert program name to CString.
+            let prog_os: &OsStr = prog.as_ref();
+            let Ok(prog_cstring) = CString::new(prog_os.as_bytes()) else {
+                return Err(self.make_error_no_such_file_or_dir(&prog));
+            };
+
+            // Prepare arguments for execvp.
+            let mut argv = Vec::new();
+
+            // Convert arg0 to CString.
+            let arg0_os: &OsStr = arg0.as_ref();
+            let Ok(arg0_cstring) = CString::new(arg0_os.as_bytes()) else {
+                return Err(self.make_error_no_such_file_or_dir(&prog));
+            };
+            argv.push(arg0_cstring);
+
+            // Convert remaining arguments to CString.
+            for arg in args {
+                let arg_os = arg;
+                let Ok(arg_cstring) = CString::new(arg_os.as_bytes()) else {
+                    return Err(self.make_error_no_such_file_or_dir(&prog));
+                };
+                argv.push(arg_cstring);
+            }
+
+            let env_cstrings = custom_env.map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| CString::new(e.clone()).ok())
+                    .collect::<Vec<_>>()
+            });
+            let mut envp_ptrs = env_cstrings.as_ref().map(|cstrings| {
+                let mut ptrs: Vec<*mut libc::c_char> =
+                    cstrings.iter().map(|cs| cs.as_ptr().cast_mut()).collect();
+                ptrs.push(std::ptr::null_mut());
+                ptrs
+            });
+
+            // SAFETY: ptrs is a null-terminated array of pointers into
+            // env_cstrings, both alive until execvp; env is single-threaded here.
+            let orig = envp_ptrs.as_mut().map(|ptrs| unsafe {
+                let p = *environ();
+                *environ() = ptrs.as_mut_ptr();
+                p
+            });
+
+            // Execute the program using execvp. this replaces the current
+            // process. The execvp function takes care of appending a NULL
+            // argument to the argument list so that we don't have to.
+            // unwrap_err since execvp should never return on success
+            let exec_error = execvp(&prog_cstring, &argv).unwrap_err();
+
+            if let Some(orig) = orig {
+                // SAFETY: restores the pointer saved above.
+                unsafe {
+                    *environ() = orig;
+                }
+            }
+
+            match exec_error {
+                nix::errno::Errno::ENOENT => Err(self.make_error_no_such_file_or_dir(&prog)),
+                e => {
+                    uucore::show_error!("{}: {}", prog.quote(), strip_errno(&e.into()));
+                    Err(126.into())
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            // Fallback to Command::status for non-Unix systems
+            let mut cmd = std::process::Command::new(&*prog);
+            cmd.args(args);
+            if let Some(entries) = custom_env {
+                cmd.env_clear();
+                for entry in entries {
+                    if let Some(key) = entry_key(entry) {
+                        let val = &entry[key.len() + 1..];
+                        if let (Ok(k), Ok(v)) = (std::str::from_utf8(key), std::str::from_utf8(val))
+                        {
+                            cmd.env(k, v);
+                        }
+                    }
+                }
+            }
+
+            match cmd.status() {
+                Ok(exit) if !exit.success() => Err(exit.code().unwrap_or(1).into()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+                    ) =>
+                {
+                    Err(self.make_error_no_such_file_or_dir(&prog))
+                }
+                Err(e) => {
+                    uucore::show_error!("{}: {}", prog.quote(), strip_errno(&e));
+                    Err(126.into())
+                }
+                Ok(_) => Ok(()),
+            }
+        }
+    }
+}
+
+fn apply_removal_of_all_env_vars(opts: &Options<'_>) {
+    // remove all env vars if told to ignore presets
+    if opts.ignore_env {
+        for (ref name, _) in env::vars_os() {
+            unsafe {
+                env::remove_var(name);
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(unix), allow(clippy::elidable_lifetime_names))]
+fn make_options<'a>(
+    matches: &'a clap::ArgMatches,
+    #[cfg(all(unix, not(target_os = "fuchsia")))] signal_apply_all: &BTreeSet<&'static str>,
+) -> UResult<Options<'a>> {
+    let ignore_env = matches.get_flag("ignore-environment");
+    let line_ending = LineEnding::from_zero_flag(matches.get_flag("null"));
+    let quoting_style = matches
+        .get_one::<String>(qs_parser::QUOTING_STYLE)
+        .and_then(QuotingStyle::parse);
+    let running_directory = matches
+        .get_one::<OsString>("chdir")
+        .map(OsString::as_os_str);
+    let env0_from = matches
+        .get_one::<OsString>(options::ENV0_FROM)
+        .map(OsString::as_os_str);
+    let unsets = match matches.get_many::<OsString>("unset") {
+        Some(v) => v.map(OsString::as_os_str).collect(),
+        None => Vec::new(),
+    };
+    let argv0 = matches
+        .get_one::<OsString>("argv0")
+        .map(OsString::as_os_str);
+
+    #[cfg(all(unix, not(target_os = "fuchsia")))]
+    let signal_actions = build_signal_actions(matches, signal_apply_all)?;
+    #[cfg(all(unix, not(target_os = "fuchsia")))]
+    let list_signal_handling = matches.get_flag(options::LIST_SIGNAL_HANDLING);
+
+    let mut opts = Options {
+        ignore_env,
+        line_ending,
+        quoting_style,
+        running_directory,
+        env0_from,
+        unsets,
+        sets: vec![],
+        program: vec![],
+        argv0,
+        #[cfg(all(unix, not(target_os = "fuchsia")))]
+        signal_actions,
+        #[cfg(all(unix, not(target_os = "fuchsia")))]
+        list_signal_handling,
+    };
+
+    let mut begin_prog_opts = false;
+    if let Some(mut iter) = matches.get_many::<OsString>("vars") {
+        // read NAME=VALUE arguments (and up to a single program argument)
+        while !begin_prog_opts {
+            if let Some(opt) = iter.next() {
+                if opt == "-" {
+                    opts.ignore_env = true;
+                } else {
+                    begin_prog_opts = parse_name_value_opt(&mut opts, opt)?;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // read any leftover program arguments
+        for opt in iter {
+            parse_program_opt(&mut opts, opt)?;
+        }
+    }
+
+    Ok(opts)
+}
+
+fn apply_unset_env_vars(opts: &Options<'_>) -> Result<(), Box<dyn UError>> {
+    for name in &opts.unsets {
+        validate_unset_arg(name)?;
+        unsafe {
+            env::remove_var(name);
+        }
+    }
+    Ok(())
+}
+
+fn apply_change_directory(opts: &Options<'_>) -> Result<(), Box<dyn UError>> {
+    // GNU env tests this behavior
+    if opts.program.is_empty() && opts.running_directory.is_some() {
+        return Err(UUsageError::new(
+            125,
+            translate!("env-error-must-specify-command-with-chdir"),
+        ));
+    }
+
+    if let Some(d) = opts.running_directory {
+        match env::set_current_dir(d) {
+            Ok(()) => d,
+            Err(error) => {
+                return Err(USimpleError::new(
+                    125,
+                    translate!("env-error-cannot-change-directory", "directory" => d.quote(), "error" => error),
+                ));
+            }
+        };
+    }
+    Ok(())
+}
+
+fn apply_specified_env_vars(opts: &Options<'_>) {
+    // set specified env vars
+    for (name, val) in &opts.sets {
+        /*
+         * set_var panics if name is an empty string
+         * set_var internally calls setenv (on unix at least), while GNU env calls putenv instead.
+         *
+         * putenv returns successfully if provided with something like "=a" and modifies the environ
+         * variable to contain "=a" inside it, effectively modifying the process' current environment
+         * to contain a malformed string in it. Using GNU's implementation, the command `env =a`
+         * prints out the malformed string and even invokes the child process with that environment.
+         * This can be seen by using `env -i =a env` or `env -i =a cat /proc/self/environ`
+         *
+         * POSIX.1-2017 doesn't seem to mention what to do if the string is malformed (at least
+         * not in "Chapter 8, Environment Variables" or in the definition for environ and various
+         * exec*'s or in the description of env in the "Shell & Utilities" volume).
+         *
+         * It also doesn't specify any checks for putenv before modifying the environ variable, which
+         * is likely why glibc doesn't do so. However, the first set_var argument cannot point to
+         * an empty string or a string containing '='.
+         *
+         * There is no benefit in replicating GNU's env behavior, since it will only modify the
+         * environment in weird ways
+         */
+
+        if name.is_empty() {
+            show_warning!(
+                "{}",
+                translate!("env-warning-no-name-specified", "value" => val.quote())
+            );
+            continue;
+        }
+        unsafe {
+            env::set_var(name, val);
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+fn apply_signal_action(
+    request: &SignalRequest,
+    action_kind: SignalActionKind,
+) -> UResult<Option<SignalActionKind>> {
+    let mut sigpipe_action = None;
+    request.for_each_signal(|sig_value| {
+        // On some platforms ALL_SIGNALS may contain values that are not valid in libc.
+        // Skip those invalid ones and continue (GNU env also ignores undefined signals).
+        if !signal_is_valid(sig_value) {
+            return Ok(());
+        }
+
+        match action_kind {
+            SignalActionKind::Default => reset_signal(sig_value)?,
+            SignalActionKind::Ignore => ignore_signal(sig_value)?,
+            SignalActionKind::Block => block_signal(sig_value)?,
+        }
+
+        if sig_value == libc::SIGPIPE as usize {
+            sigpipe_action = Some(action_kind);
+            // Set environment variable to communicate to Rust child processes
+            // that SIGPIPE should be default (not ignored)
+            if matches!(action_kind, SignalActionKind::Default) {
+                unsafe {
+                    env::set_var("RUST_SIGPIPE", "default");
+                }
+            }
+        }
+
+        Ok(())
+    })?;
+    Ok(sigpipe_action)
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+fn ignore_signal(sig: usize) -> UResult<()> {
+    // SAFETY: This is safe because we write the handler for each signal only once, and therefore "the current handler is the default", as the documentation requires it.
+    // nix::sys::signal::Signal does not cover real-time signals, so we need to call
+    // libc::signal directly.
+    let result = unsafe {
+        let res = libc::signal(sig as core::ffi::c_int, libc::SIG_IGN);
+        nix::errno::Errno::result(res)
+    };
+    if let Err(err) = result {
+        return Err(USimpleError::new(
+            125,
+            translate!("env-error-failed-set-signal-action", "signal" => (sig as i32), "error" => err.desc()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+fn reset_signal(sig: usize) -> UResult<()> {
+    // nix::sys::signal::Signal does not cover real-time signals, so we need to call
+    // libc::signal directly.
+    let result = unsafe {
+        let res = libc::signal(sig as core::ffi::c_int, libc::SIG_DFL);
+        nix::errno::Errno::result(res)
+    };
+    if let Err(err) = result {
+        return Err(USimpleError::new(
+            125,
+            translate!("env-error-failed-set-signal-action", "signal" => (sig as i32), "error" => err.desc()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+fn sigset_from_signal_value(sig: usize) -> UResult<SigSet> {
+    // nix::sys::signal::Signal does not cover real time signals, so we need to build
+    // sigset_t manually using libc.
+    let mut sigset: libc::sigset_t = unsafe { zeroed() };
+
+    if let Err(err) = unsafe { nix::errno::Errno::result(libc::sigemptyset(&raw mut sigset)) } {
+        return Err(USimpleError::new(
+            125,
+            translate!(
+                "env-error-failed-set-signal-action",
+                "signal" => (sig as i32),
+                "error" => err.desc()
+            ),
+        ));
+    }
+
+    if let Err(err) = unsafe {
+        nix::errno::Errno::result(libc::sigaddset(&raw mut sigset, sig as core::ffi::c_int))
+    } {
+        return Err(USimpleError::new(
+            125,
+            translate!(
+                "env-error-failed-set-signal-action",
+                "signal" => (sig as i32),
+                "error" => err.desc()
+            ),
+        ));
+    }
+
+    Ok(unsafe { SigSet::from_sigset_t_unchecked(sigset) })
+}
+
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+fn block_signal(sig: usize) -> UResult<()> {
+    let set = sigset_from_signal_value(sig)?;
+
+    if let Err(err) = sigprocmask(SigmaskHow::SIG_BLOCK, Some(&set), None) {
+        return Err(USimpleError::new(
+            125,
+            translate!(
+                "env-error-failed-set-signal-action",
+                "signal" => (sig as i32),
+                "error" => err.desc()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// List the signals that are not at their default, blocked or ignored,
+/// whether env was asked for that or inherited it, as GNU does.
+#[cfg(all(unix, not(target_os = "fuchsia")))]
+fn list_signal_handling() {
+    let mask = SigSet::thread_get_mask().unwrap_or_else(|_| SigSet::empty());
+    for sig_value in 1..=signal_number_upper_bound() {
+        let Some(signal_name) = signal_name_by_value(sig_value) else {
+            continue;
+        };
+        if !signal_is_valid(sig_value) {
+            continue;
+        }
+        let sig = sig_value as libc::c_int;
+        // SAFETY: a null new action only queries the current one, into a
+        // zeroed `sigaction` that `sigaction(2)` fills in entirely.
+        let ignored = unsafe {
+            let mut current: libc::sigaction = zeroed();
+            libc::sigaction(sig, std::ptr::null(), &raw mut current) == 0
+                && current.sa_sigaction == libc::SIG_IGN
+        };
+        // SAFETY: `sigismember` only reads the set it is given.
+        let blocked = unsafe { libc::sigismember(mask.as_ref(), sig) == 1 };
+        let state = match (blocked, ignored) {
+            (true, true) => "BLOCK,IGNORE",
+            (true, false) => "BLOCK",
+            (false, true) => "IGNORE",
+            (false, false) => continue,
+        };
+        eprintln!("{signal_name:<10} ({sig:2}): {state}");
+    }
+}
+
+#[uucore::main]
+pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    EnvAppData::default().run_env(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uucore::locale;
+
+    #[test]
+    fn test_split_string_environment_vars_test() {
+        temp_env::with_var("FOO", Some("BAR"), || {
+            assert_eq!(
+                NCvt::convert(vec!["FOO=bar", "sh", "-c", "echo xBARx =$FOO="]),
+                parse_args_from_str(&NCvt::convert(r#"FOO=bar sh -c "echo x${FOO}x =\$FOO=""#))
+                    .unwrap(),
+            );
+        });
+    }
+
+    #[test]
+    fn test_split_string_misc() {
+        assert_eq!(
+            NCvt::convert(vec!["A=B", "FOO=AR", "sh", "-c", "echo $A$FOO"]),
+            parse_args_from_str(&NCvt::convert(r#"A=B FOO=AR  sh -c "echo \$A\$FOO""#)).unwrap(),
+        );
+        assert_eq!(
+            NCvt::convert(vec!["A=B", "FOO=AR", "sh", "-c", "echo $A$FOO"]),
+            parse_args_from_str(&NCvt::convert(r"A=B FOO=AR  sh -c 'echo $A$FOO'")).unwrap()
+        );
+        assert_eq!(
+            NCvt::convert(vec!["A=B", "FOO=AR", "sh", "-c", "echo $A$FOO"]),
+            parse_args_from_str(&NCvt::convert(r"A=B FOO=AR  sh -c 'echo $A$FOO'")).unwrap()
+        );
+
+        assert_eq!(
+            NCvt::convert(vec!["-i", "A=B ' C"]),
+            parse_args_from_str(&NCvt::convert(r"-i A='B \' C'")).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_error_cases() {
+        temp_env::with_var("LANG", Some("C"), || {
+            let _ = locale::setup_localization("env");
+        });
+
+        // Test EnvBackslashCNotAllowedInDoubleQuotes
+        let result = parse_args_from_str(&NCvt::convert(r#"sh -c "echo \c""#));
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "'\\c' must not appear in double-quoted -S string at position 13"
+        );
+
+        // Test EnvInvalidBackslashAtEndOfStringInMinusS
+        let result = parse_args_from_str(&NCvt::convert(r#"sh -c "echo \"#));
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "no terminating quote in -S string at position 13 for quote '\"'"
+        );
+
+        // Test EnvInvalidSequenceBackslashXInMinusS
+        let result = parse_args_from_str(&NCvt::convert(r#"sh -c "echo \x""#));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid sequence '\\x' in -S")
+        );
+
+        // Test EnvMissingClosingQuote
+        let result = parse_args_from_str(&NCvt::convert(r#"sh -c "echo "#));
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "no terminating quote in -S string at position 12 for quote '\"'"
+        );
+
+        // Test variable-related errors
+        let result = parse_args_from_str(&NCvt::convert(r"echo ${FOO"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("only ${VARNAME} expansion is supported, error at: ${FOO")
+        );
+
+        let result = parse_args_from_str(&NCvt::convert(r"echo ${FOO:-value}"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("only ${VARNAME} expansion is supported")
+        );
+
+        let result = parse_args_from_str(&NCvt::convert(r"echo $FOO"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("only ${VARNAME} expansion is supported")
+        );
+        let result = parse_args_from_str(&NCvt::convert(r"echo ${1FOO}"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("only ${VARNAME} expansion is supported, error at: ${1FOO}")
+        );
+
+        let result = parse_args_from_str(&NCvt::convert(r"echo ${FOO?}"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("only ${VARNAME} expansion is supported")
+        );
+    }
+}
