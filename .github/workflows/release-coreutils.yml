@@ -1,0 +1,139 @@
+name: Release Coreutils
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: false
+        default: 'v0.1.0'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            features: feat_os_unix_musl
+            asset: coreutils-linux-x64-musl
+            ext: ''
+            musl: true
+          - name: linux-arm64-musl
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            features: feat_os_unix_musl
+            asset: coreutils-linux-arm64-musl
+            ext: ''
+            musl: true
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: feat_os_windows
+            asset: coreutils-windows-x64.exe
+            ext: '.exe'
+            musl: false
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            features: feat_os_unix
+            asset: coreutils-macos-arm64
+            ext: ''
+            musl: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install musl-tools
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-release-small-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-release-small-
+
+      - name: Build multicall coreutils binary
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.musl && '-C target-feature=+crt-static' || '' }}
+        run: |
+          cargo build \
+            --profile release-small \
+            --no-default-features \
+            --features "${{ matrix.features }}" \
+            --target "${{ matrix.target }}" \
+            --bin coreutils
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release-small/coreutils${{ matrix.ext }}" "dist/${{ matrix.asset }}"
+          ls -lh "dist/${{ matrix.asset }}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA512SUMS.txt
+        shell: bash
+        run: |
+          cd dist
+          chmod +x coreutils-linux-x64-musl coreutils-linux-arm64-musl coreutils-macos-arm64
+          sha512sum coreutils-* > SHA512SUMS.txt
+          cat SHA512SUMS.txt
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "Awesome-OS Coreutils ${TAG}" \
+              --generate-notes
+          fi
